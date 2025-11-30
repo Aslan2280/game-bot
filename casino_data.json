@@ -1,11 +1,35 @@
 {
   "6539341659": {
-    "balance": 1000000500,
+    "balance": 1000004999,
     "level": 1,
     "games_played": 6,
     "wins": 2,
     "used_promocodes": [
+      "WELCOME",
+      "30НОЯБРЯ"
+    ]
+  },
+  "6589011383": {
+    "balance": 1500,
+    "level": 1,
+    "games_played": 0,
+    "wins": 0,
+    "used_promocodes": [
       "WELCOME"
     ]
+  },
+  "1747477495": {
+    "balance": 900,
+    "level": 1,
+    "games_played": 1,
+    "wins": 0,
+    "used_promocodes": []
+  },
+  "6998961143": {
+    "balance": 9000,
+    "level": 1,
+    "games_played": 2,
+    "wins": 2,
+    "used_promocodes": []
   }
 }

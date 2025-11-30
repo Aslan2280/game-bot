@@ -12,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # === КОНФИГУРАЦИЯ ===
-BOT_TOKEN = "8229788169:AAFSq8HtJN7DsHV3-Zmf4AC-6iHNsAVPAUU"
+BOT_TOKEN = "8382913453:AAGD3phfvwnm4f0wjAmBljS8lN-ZLHM5MHA"
 ADMIN_ID = 6539341659
 DATABASE_FILE = "casino_data.json"
 PROMO_FILE = "promo_codes.json"
@@ -1573,3 +1573,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

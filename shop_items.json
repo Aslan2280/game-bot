@@ -7,5 +7,14 @@
     "description": "НФТ в единственном экземпляре",
     "emoji": "🎁",
     "created_at": "1764445953.9034176"
+  },
+  "LoliPop#1": {
+    "name": "НФТ Lol Pop #1",
+    "price": 1,
+    "quantity": 0,
+    "sold": 1,
+    "description": "Lol Pop",
+    "emoji": "🍭",
+    "created_at": "1764487781.8266792"
   }
 }

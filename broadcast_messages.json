@@ -1,0 +1,17 @@
+{
+  "messages": [
+    {
+      "id": 1,
+      "message": "Привет",
+      "sent_by": 6539341659,
+      "sent_count": 1,
+      "failed_count": 0,
+      "timestamp": "1764445953.9034176",
+      "total_users": 1
+    }
+  ],
+  "stats": {
+    "total_broadcasts": 1,
+    "total_messages_sent": 1
+  }
+}

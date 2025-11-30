@@ -3,8 +3,12 @@ import os
 import random
 import logging
 from typing import Dict, Any, Optional, List
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # === КОНФИГУРАЦИЯ ===
 BOT_TOKEN = "8382913453:AAGD3phfvwnm4f0wjAmBljS8lN-ZLHM5MHA"
@@ -24,6 +28,16 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# === СОСТОЯНИЯ ДЛЯ FSM ===
+class GameStates(StatesGroup):
+    waiting_bet = State()
+    waiting_dice_bet = State()
+
+class TransferStates(StatesGroup):
+    selecting_item = State()
+    entering_recipient = State()
+    confirming = State()
 
 # === СИСТЕМА БАЗЫ ДАННЫХ JSON ===
 class JSONDatabase:
@@ -160,10 +174,6 @@ class PromoCodeSystem:
             'message': f'🎉 Промокод активирован! Получено: {reward} монет'
         }
     
-    def get_promo_info(self, code: str) -> Optional[Dict]:
-        promos = self._read_promos()
-        return promos.get(code)
-    
     def get_all_promos(self) -> Dict:
         return self._read_promos()
 
@@ -276,15 +286,7 @@ class ShopSystem:
         inventory = self._read_inventory()
         return inventory.get(str(user_id), [])
     
-    def get_user_item_by_index(self, user_id: int, item_index: int) -> Optional[Dict]:
-        """Получить предмет по индексу в инвентаре"""
-        inventory = self.get_user_inventory(user_id)
-        if 0 <= item_index < len(inventory):
-            return inventory[item_index]
-        return None
-    
     def transfer_item(self, from_user_id: int, to_user_id: int, item_index: int) -> Dict[str, Any]:
-        """Передача предмета от одного пользователя другому"""
         inventory = self._read_inventory()
         
         from_user_inv = inventory.get(str(from_user_id), [])
@@ -293,16 +295,10 @@ class ShopSystem:
         if item_index >= len(from_user_inv):
             return {'success': False, 'message': '❌ Предмет не найден в вашем инвентаре!'}
         
-        # Получаем предмет
         item_to_transfer = from_user_inv[item_index]
-        
-        # Удаляем у отправителя
         from_user_inv.pop(item_index)
-        
-        # Добавляем получателю
         to_user_inv.append(item_to_transfer)
         
-        # Обновляем инвентари
         inventory[str(from_user_id)] = from_user_inv
         inventory[str(to_user_id)] = to_user_inv
         
@@ -311,18 +307,8 @@ class ShopSystem:
         return {
             'success': True,
             'item_name': item_to_transfer['name'],
-            'from_user': from_user_id,
-            'to_user': to_user_id,
             'message': f'✅ {item_to_transfer["emoji"]} {item_to_transfer["name"]} успешно передан!'
         }
-    
-    def remove_item(self, item_id: str) -> bool:
-        shop = self._read_shop()
-        if item_id not in shop:
-            return False
-        del shop[item_id]
-        self._write_shop(shop)
-        return True
 
 # === ИГРОВОЙ ДВИЖОК ===
 class CasinoGames:
@@ -453,21 +439,28 @@ class CasinoGames:
                 'new_balance': new_balance
             }
 
-# === TELEGRAM BOT HANDLERS ===
-class CasinoBot:
-    def __init__(self):
-        self.db = JSONDatabase()
-        self.games = CasinoGames(self.db)
-        self.promo_system = PromoCodeSystem()
-        self.shop_system = ShopSystem()
-        self.user_bets = {}
-        self.user_transfers = {}  # Для хранения данных о передачах
+# === ИНИЦИАЛИЗАЦИЯ ===
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+
+db = JSONDatabase()
+games = CasinoGames(db)
+promo_system = PromoCodeSystem()
+shop_system = ShopSystem()
+
+# Глобальные переменные для хранения состояний
+user_choices = {}
+user_transfers = {}
+
+# === ОСНОВНЫЕ КОМАНДЫ ===
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user = message.from_user
+    db.get_user(user.id)
     
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        self.db.get_user(user.id)
-        
-        welcome_text = f"""
+    welcome_text = f"""
 🎰 Добро пожаловать в Казино Бот, {user.first_name}!
 
 💰 Начальный баланс: 1000 монет
@@ -482,17 +475,18 @@ class CasinoBot:
 🎫 Промокод: /promo [код]
 🔄 Передать NFT: /transfer
 🏆 Топ игроков: /top
-        """
-        await update.message.reply_text(welcome_text)
+    """
+    await message.answer(welcome_text)
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    user = message.from_user
+    user_data = db.get_user(user.id)
+    inventory = shop_system.get_user_inventory(user.id)
     
-    async def profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        user_data = self.db.get_user(user.id)
-        inventory = self.shop_system.get_user_inventory(user.id)
-        
-        win_rate = (user_data['wins'] / user_data['games_played'] * 100) if user_data['games_played'] > 0 else 0
-        
-        profile_text = f"""
+    win_rate = (user_data['wins'] / user_data['games_played'] * 100) if user_data['games_played'] > 0 else 0
+    
+    profile_text = f"""
 📊 Профиль {user.first_name}
 
 💰 Баланс: {user_data['balance']} монет
@@ -501,597 +495,567 @@ class CasinoBot:
 📈 Процент побед: {win_rate:.1f}%
 🎫 Использовано промокодов: {len(user_data.get('used_promocodes', []))}
 🎒 NFT в коллекции: {len(inventory)}
-        """
-        await update.message.reply_text(profile_text)
+    """
+    await message.answer(profile_text)
+
+@router.message(Command("top"))
+async def cmd_top(message: Message):
+    top_users = db.get_top_users(10)
     
-    async def top(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        top_users = self.db.get_top_users(10)
-        
-        if not top_users:
-            await update.message.reply_text("📊 Пока нет игроков в рейтинге!")
-            return
-        
-        top_text = "🏆 ТОП ИГРОКОВ:\n\n"
-        for i, (user_id, user_data) in enumerate(top_users, 1):
-            try:
-                user_obj = await context.bot.get_chat(int(user_id))
-                name = user_obj.first_name
-            except:
-                name = f"Игрок {user_id}"
-            
-            top_text += f"{i}. {name} - {user_data.get('balance', 0)} монет\n"
-        
-        await update.message.reply_text(top_text)
+    if not top_users:
+        await message.answer("📊 Пока нет игроков в рейтинге!")
+        return
     
-    async def promo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        
-        if not context.args:
-            await update.message.reply_text(
-                "🎫 Система промокодов\n\n"
-                "Использование: /promo [код]\n"
-                "Пример: /promo WELCOME500\n\n"
-                "💡 Промокоды дают бонусные монеты!"
-            )
-            return
-        
-        promo_code = context.args[0].upper().strip()
-        result = self.promo_system.use_promo(promo_code, user.id, self.db)
-        await update.message.reply_text(result['message'])
-    
-    async def shop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        shop_items = self.shop_system.get_shop_items()
-        
-        if not shop_items:
-            await update.message.reply_text("🛍️ Магазин пуст! Зайдите позже.")
-            return
-        
-        shop_text = "🛍️ МАГАЗИН NFT\n\n"
-        
-        for item_id, item in shop_items.items():
-            if item['quantity'] > 0:
-                shop_text += f"{item['emoji']} {item['name']}\n"
-                shop_text += f"💵 Цена: {item['price']} монет\n"
-                shop_text += f"📦 В наличии: {item['quantity']} шт.\n"
-                if item['description']:
-                    shop_text += f"📝 {item['description']}\n"
-                shop_text += f"🛒 Купить: /buy_{item_id}\n"
-                shop_text += "────────────────────\n"
-        
-        shop_text += "\n🎒 Посмотреть коллекцию: /inventory"
-        await update.message.reply_text(shop_text)
-    
-    async def inventory(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        inventory = self.shop_system.get_user_inventory(user.id)
-        
-        if not inventory:
-            await update.message.reply_text("🎒 Ваша коллекция NFT пуста!\n🛍️ Зайдите в магазин: /shop")
-            return
-        
-        inv_text = f"🎒 КОЛЛЕКЦИЯ {user.first_name}\n\n"
-        
-        for i, item in enumerate(inventory, 1):
-            inv_text += f"{i}. {item['emoji']} {item['name']}\n"
-            if item['description']:
-                inv_text += f"   📝 {item['description']}\n"
-            inv_text += f"   🆔 ID: {item.get('unique_id', 'N/A')}\n"
-            inv_text += "────────────────────\n"
-        
-        inv_text += f"\n📊 Всего предметов: {len(inventory)}"
-        inv_text += f"\n🔄 Передать предмет: /transfer"
-        
-        await update.message.reply_text(inv_text)
-    
-    async def handle_buy_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команд покупки /buy_*"""
-        user = update.effective_user
-        command = update.message.text
-        
-        if command.startswith('/buy_'):
-            item_id = command[5:]
-            result = self.shop_system.buy_item(item_id, user.id, self.db)
-            await update.message.reply_text(result['message'])
-        else:
-            await update.message.reply_text("❌ Неверная команда покупки!")
-    
-    # === СИСТЕМА ПЕРЕДАЧИ NFT ===
-    async def transfer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало процесса передачи NFT"""
-        user = update.effective_user
-        inventory = self.shop_system.get_user_inventory(user.id)
-        
-        if not inventory:
-            await update.message.reply_text("🎒 Ваша коллекция NFT пуста!\nСначала купите что-нибудь в магазине: /shop")
-            return
-        
-        # Сохраняем инвентарь для передачи
-        self.user_transfers[user.id] = {
-            'inventory': inventory,
-            'step': 'select_item'
-        }
-        
-        inv_text = "🔄 ВЫБЕРИТЕ NFT ДЛЯ ПЕРЕДАЧИ:\n\n"
-        
-        for i, item in enumerate(inventory, 1):
-            inv_text += f"{i}. {item['emoji']} {item['name']}\n"
-            if item['description']:
-                inv_text += f"   📝 {item['description']}\n"
-            inv_text += "────────────────────\n"
-        
-        inv_text += "\n📝 Введите номер предмета для передачи:"
-        
-        await update.message.reply_text(inv_text)
-    
-    async def handle_transfer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка передачи NFT"""
-        user = update.effective_user
-        text = update.message.text.strip()
-        
-        if user.id not in self.user_transfers:
-            await update.message.reply_text("❌ Сначала начните процесс передачи: /transfer")
-            return
-        
-        transfer_data = self.user_transfers[user.id]
-        
+    top_text = "🏆 ТОП ИГРОКОВ:\n\n"
+    for i, (user_id, user_data) in enumerate(top_users, 1):
         try:
-            if transfer_data['step'] == 'select_item':
-                # Выбор предмета
-                item_index = int(text) - 1
-                inventory = transfer_data['inventory']
-                
-                if item_index < 0 or item_index >= len(inventory):
-                    await update.message.reply_text("❌ Неверный номер предмета!")
-                    return
-                
-                selected_item = inventory[item_index]
-                transfer_data['selected_item_index'] = item_index
-                transfer_data['step'] = 'enter_username'
-                transfer_data['selected_item_name'] = selected_item['name']
-                
-                await update.message.reply_text(
-                    f"✅ Выбран: {selected_item['emoji']} {selected_item['name']}\n\n"
-                    f"📝 Теперь введите @username получателя или его ID:\n"
-                    f"Пример: @username или 123456789"
-                )
-            
-            elif transfer_data['step'] == 'enter_username':
-                # Ввод получателя
-                recipient_input = text.strip()
-                
-                try:
-                    if recipient_input.startswith('@'):
-                        # Поиск по username
-                        username = recipient_input[1:]
-                        # В реальном боте здесь был бы поиск пользователя по username
-                        # Для демонстрации просто сохраняем
-                        transfer_data['recipient_input'] = recipient_input
-                        transfer_data['step'] = 'confirm'
-                        
-                        await update.message.reply_text(
-                            f"🎯 Получатель: {recipient_input}\n"
-                            f"🎁 Предмет: {transfer_data['selected_item_name']}\n\n"
-                            f"⚠️ Внимание: передача необратима!\n"
-                            f"✅ Для подтверждения введите 'да'\n"
-                            f"❌ Для отмены введите 'нет'"
-                        )
-                    
-                    elif recipient_input.isdigit():
-                        # Поиск по ID
-                        recipient_id = int(recipient_input)
-                        transfer_data['recipient_id'] = recipient_id
-                        transfer_data['step'] = 'confirm'
-                        
-                        try:
-                            recipient_user = await context.bot.get_chat(recipient_id)
-                            recipient_name = recipient_user.first_name
-                        except:
-                            recipient_name = f"ID {recipient_id}"
-                        
-                        await update.message.reply_text(
-                            f"🎯 Получатель: {recipient_name}\n"
-                            f"🎁 Предмет: {transfer_data['selected_item_name']}\n\n"
-                            f"⚠️ Внимание: передача необратима!\n"
-                            f"✅ Для подтверждения введите 'да'\n"
-                            f"❌ Для отмены введите 'нет'"
-                        )
-                    
-                    else:
-                        await update.message.reply_text("❌ Неверный формат! Введите @username или ID пользователя")
-                
-                except Exception as e:
-                    await update.message.reply_text(f"❌ Ошибка при поиске пользователя: {e}")
-            
-            elif transfer_data['step'] == 'confirm':
-                # Подтверждение передачи
-                if text.lower() in ['да', 'yes', 'y', 'д']:
-                    # Выполняем передачу
-                    item_index = transfer_data['selected_item_index']
-                    
-                    if 'recipient_id' in transfer_data:
-                        recipient_id = transfer_data['recipient_id']
-                    else:
-                        # В реальном боте здесь был бы поиск по username
-                        # Для демонстрации используем фиктивный ID
-                        await update.message.reply_text("❌ Поиск по username временно недоступен. Используйте ID пользователя.")
-                        del self.user_transfers[user.id]
-                        return
-                    
-                    result = self.shop_system.transfer_item(user.id, recipient_id, item_index)
-                    
-                    if result['success']:
-                        # Уведомляем получателя
-                        try:
-                            recipient_user = await context.bot.get_chat(recipient_id)
-                            await context.bot.send_message(
-                                recipient_id,
-                                f"🎁 Вам передали NFT!\n\n"
-                                f"{result['item_name']}\n"
-                                f"📤 От: {user.first_name} (@{user.username if user.username else 'N/A'})\n\n"
-                                f"🎒 Посмотреть коллекцию: /inventory"
-                            )
-                        except:
-                            pass  # Не смогли уведомить получателя
-                        
-                        await update.message.reply_text(
-                            f"✅ {result['message']}\n"
-                            f"🎯 Получатель уведомлен о передаче!"
-                        )
-                    else:
-                        await update.message.reply_text(result['message'])
-                    
-                    del self.user_transfers[user.id]
-                
-                elif text.lower() in ['нет', 'no', 'n', 'н']:
-                    await update.message.reply_text("❌ Передача отменена.")
-                    del self.user_transfers[user.id]
-                
-                else:
-                    await update.message.reply_text("❌ Введите 'да' для подтверждения или 'нет' для отмены")
+            chat_member = await bot.get_chat(user_id)
+            name = chat_member.first_name
+        except:
+            name = f"Игрок {user_id}"
         
-        except ValueError:
-            await update.message.reply_text("❌ Неверный формат! Введите число.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Произошла ошибка: {e}")
-            del self.user_transfers[user.id]
+        top_text += f"{i}. {name} - {user_data.get('balance', 0)} монет\n"
     
-    async def admin_promo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        
-        if user.id != ADMIN_ID:
-            await update.message.reply_text("❌ Недостаточно прав!")
-            return
-        
-        if len(context.args) < 2:
-            await update.message.reply_text(
-                "⚙️ Создание промокода (Админ)\n\n"
-                "Использование: /admin_promo [код] [награда] [лимит=100] [дни=30]\n"
-                "Пример: /admin_promo NEWYEAR 500 50 7"
-            )
-            return
-        
-        promo_code = context.args[0].upper().strip()
-        reward = int(context.args[1])
-        uses_limit = int(context.args[2]) if len(context.args) > 2 else 100
-        expires_days = int(context.args[3]) if len(context.args) > 3 else 30
-        
-        success = self.promo_system.create_promo(promo_code, reward, uses_limit, expires_days)
-        
-        if success:
-            await update.message.reply_text(
-                f"✅ Промокод создан!\n\n"
-                f"🎫 Код: {promo_code}\n"
-                f"💰 Награда: {reward} монет\n"
-                f"📊 Лимит: {uses_limit} использований\n"
-                f"⏰ Срок: {expires_days} дней"
-            )
-        else:
-            await update.message.reply_text("❌ Промокод уже существует!")
+    await message.answer(top_text)
+
+# === СИСТЕМА ПРОМОКОДОВ ===
+@router.message(Command("promo"))
+async def cmd_promo(message: Message):
+    if not message.text or len(message.text.split()) < 2:
+        await message.answer(
+            "🎫 Система промокодов\n\n"
+            "Использование: /promo [код]\n"
+            "Пример: /promo WELCOME500\n\n"
+            "💡 Промокоды дают бонусные монеты!"
+        )
+        return
     
-    async def admin_promo_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        
-        if user.id != ADMIN_ID:
-            await update.message.reply_text("❌ Недостаточно прав!")
-            return
-        
-        promos = self.promo_system.get_all_promos()
-        
-        if not promos:
-            await update.message.reply_text("📭 Нет активных промокодов")
-            return
-        
-        promo_text = "📋 АКТИВНЫЕ ПРОМОКОДЫ:\n\n"
-        for code, data in promos.items():
-            import datetime
-            expires = datetime.datetime.fromisoformat(data['expires_at'])
-            days_left = (expires - datetime.datetime.now()).days
-            
-            promo_text += (
-                f"🎫 {code}\n"
-                f"💰 {data['reward']} монет | 🎯 {data['uses_count']}/{data['uses_limit']}\n"
-                f"⏰ Осталось дней: {days_left}\n"
-                f"────────────────────\n"
-            )
-        
-        await update.message.reply_text(promo_text)
+    promo_code = message.text.split()[1].upper().strip()
+    result = promo_system.use_promo(promo_code, message.from_user.id, db)
+    await message.answer(result['message'])
+
+# === СИСТЕМА МАГАЗИНА ===
+@router.message(Command("shop"))
+async def cmd_shop(message: Message):
+    shop_items = shop_system.get_shop_items()
     
-    async def admin_add_item(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        
-        if user.id != ADMIN_ID:
-            await update.message.reply_text("❌ Недостаточно прав!")
-            return
-        
-        if len(context.args) < 4:
-            await update.message.reply_text(
-                "🛍️ Добавление предмета в магазин (Админ)\n\n"
-                "Использование: /admin_add_item id название цена количество\n"
-                "Дополнительно: описание эмодзи\n\n"
-                "Пример: /admin_add_item dragon1 Золотой_Дракон 1000 10\n"
-                "Пример с опцией: /admin_add_item sword1 Меч 500 20 Острый_меч ⚔️\n\n"
-                "💡 Используй подчеркивания _ вместо пробелов"
-            )
-            return
-        
-        try:
-            item_id = str(context.args[0])
-            name = str(context.args[1]).replace('_', ' ')
-            price = int(context.args[2])
-            quantity = int(context.args[3])
-            
-            description = ""
-            emoji = "🎁"
-            
-            if len(context.args) > 4:
-                description = str(context.args[4]).replace('_', ' ')
-            if len(context.args) > 5:
-                emoji = str(context.args[5])
-            
-            if price <= 0:
-                await update.message.reply_text("❌ Цена должна быть положительной!")
-                return
-            
-            if quantity <= 0:
-                await update.message.reply_text("❌ Количество должно быть положительным!")
-                return
-            
-            success = self.shop_system.add_item(item_id, name, price, quantity, description, emoji)
-            
-            if success:
-                response_text = (
-                    f"✅ Предмет добавлен в магазин!\n\n"
-                    f"{emoji} {name}\n"
-                    f"💰 Цена: {price} монет\n"
-                    f"📦 Количество: {quantity} шт.\n"
-                    f"🆔 ID: {item_id}"
-                )
-                if description:
-                    response_text += f"\n📝 Описание: {description}"
-                
-                await update.message.reply_text(response_text)
-            else:
-                await update.message.reply_text("❌ Предмет с таким ID уже существует!")
-        
-        except ValueError:
-            await update.message.reply_text("❌ Ошибка: цена и количество должны быть числами!")
-        except IndexError:
-            await update.message.reply_text("❌ Ошибка: недостаточно аргументов!")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Неожиданная ошибка: {str(e)}")
+    if not shop_items:
+        await message.answer("🛍️ Магазин пуст! Зайдите позже.")
+        return
     
-    async def admin_shop_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        
-        if user.id != ADMIN_ID:
-            await update.message.reply_text("❌ Недостаточно прав!")
-            return
-        
-        shop_items = self.shop_system.get_shop_items()
-        
-        if not shop_items:
-            await update.message.reply_text("🛍️ Магазин пуст")
-            return
-        
-        shop_text = "🛍️ ПРЕДМЕТЫ В МАГАЗИНЕ:\n\n"
-        for item_id, item in shop_items.items():
-            shop_text += (
-                f"{item['emoji']} {item['name']}\n"
-                f"🆔 ID: {item_id}\n"
-                f"💰 Цена: {item['price']} монет\n"
-                f"📦 Осталось: {item['quantity']} | Продано: {item['sold']}\n"
-                f"📝 {item['description']}\n"
-                f"────────────────────\n"
-            )
-        
-        await update.message.reply_text(shop_text)
+    shop_text = "🛍️ МАГАЗИН NFT\n\n"
     
-    async def coinflip(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("🦅 Орел", callback_data="coin_орел")],
-            [InlineKeyboardButton("🪙 Решка", callback_data="coin_решка")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+    for item_id, item in shop_items.items():
+        if item['quantity'] > 0:
+            shop_text += f"{item['emoji']} {item['name']}\n"
+            shop_text += f"💵 Цена: {item['price']} монет\n"
+            shop_text += f"📦 В наличии: {item['quantity']} шт.\n"
+            if item['description']:
+                shop_text += f"📝 {item['description']}\n"
+            shop_text += f"🛒 Купить: /buy_{item_id}\n"
+            shop_text += "────────────────────\n"
+    
+    shop_text += "\n🎒 Посмотреть коллекцию: /inventory"
+    await message.answer(shop_text)
+
+@router.message(Command("inventory"))
+async def cmd_inventory(message: Message):
+    user = message.from_user
+    inventory = shop_system.get_user_inventory(user.id)
+    
+    if not inventory:
+        await message.answer("🎒 Ваша коллекция NFT пуста!\n🛍️ Зайдите в магазин: /shop")
+        return
+    
+    inv_text = f"🎒 КОЛЛЕКЦИЯ {user.first_name}\n\n"
+    
+    for i, item in enumerate(inventory, 1):
+        inv_text += f"{i}. {item['emoji']} {item['name']}\n"
+        if item['description']:
+            inv_text += f"   📝 {item['description']}\n"
+        inv_text += "────────────────────\n"
+    
+    inv_text += f"\n📊 Всего предметов: {len(inventory)}"
+    inv_text += f"\n🔄 Передать предмет: /transfer"
+    
+    await message.answer(inv_text)
+
+@router.message(F.text.startswith("/buy_"))
+async def handle_buy(message: Message):
+    user = message.from_user
+    item_id = message.text[5:]  # Убираем "/buy_"
+    
+    result = shop_system.buy_item(item_id, user.id, db)
+    await message.answer(result['message'])
+
+# === СИСТЕМА ПЕРЕДАЧИ NFT ===
+@router.message(Command("transfer"))
+async def cmd_transfer(message: Message, state: FSMContext):
+    user = message.from_user
+    inventory = shop_system.get_user_inventory(user.id)
+    
+    if not inventory:
+        await message.answer("🎒 Ваша коллекция NFT пуста!\nСначала купите что-нибудь в магазине: /shop")
+        return
+    
+    await state.set_state(TransferStates.selecting_item)
+    await state.update_data(inventory=inventory)
+    
+    inv_text = "🔄 ВЫБЕРИТЕ NFT ДЛЯ ПЕРЕДАЧИ:\n\n"
+    
+    for i, item in enumerate(inventory, 1):
+        inv_text += f"{i}. {item['emoji']} {item['name']}\n"
+        if item['description']:
+            inv_text += f"   📝 {item['description']}\n"
+        inv_text += "────────────────────\n"
+    
+    inv_text += "\n📝 Введите номер предмета для передачи:"
+    
+    await message.answer(inv_text)
+
+@router.message(TransferStates.selecting_item)
+async def process_item_selection(message: Message, state: FSMContext):
+    try:
+        item_index = int(message.text) - 1
+        data = await state.get_data()
+        inventory = data['inventory']
         
-        self.user_bets[update.effective_user.id] = {'game': 'coinflip'}
-        await update.message.reply_text(
-            "🎯 Выберите сторону монеты и затем введите ставку цифрой:\nПример: 100",
-            reply_markup=reply_markup
+        if item_index < 0 or item_index >= len(inventory):
+            await message.answer("❌ Неверный номер предмета!")
+            return
+        
+        selected_item = inventory[item_index]
+        await state.update_data(selected_item_index=item_index, selected_item=selected_item)
+        await state.set_state(TransferStates.entering_recipient)
+        
+        await message.answer(
+            f"✅ Выбран: {selected_item['emoji']} {selected_item['name']}\n\n"
+            f"📝 Теперь введите @username получателя или его ID:\n"
+            f"Пример: @username или 123456789"
         )
     
-    async def slots(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.user_bets[update.effective_user.id] = {'game': 'slots'}
-        await update.message.reply_text("🎰 Введите ставку для игровых автоматов:\nПример: 50")
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введите число!")
+
+@router.message(TransferStates.entering_recipient)
+async def process_recipient(message: Message, state: FSMContext):
+    recipient_input = message.text.strip()
     
-    async def dice_game(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        self.user_bets[update.effective_user.id] = {'game': 'dice'}
-        await update.message.reply_text("🎲 Введите ставку и предсказание (1-6):\nПример: 100 3")
-    
-    async def handle_bet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        text = update.message.text.strip()
+    try:
+        if recipient_input.startswith('@'):
+            await state.update_data(recipient_input=recipient_input)
+            await state.set_state(TransferStates.confirming)
+            
+            data = await state.get_data()
+            selected_item = data['selected_item']
+            
+            await message.answer(
+                f"🎯 Получатель: {recipient_input}\n"
+                f"🎁 Предмет: {selected_item['emoji']} {selected_item['name']}\n\n"
+                f"⚠️ Внимание: передача необратима!\n"
+                f"✅ Для подтверждения введите 'да'\n"
+                f"❌ Для отмены введите 'нет'"
+            )
         
-        if user_id not in self.user_bets:
-            await update.message.reply_text("❌ Сначала выберите игру!")
+        elif recipient_input.isdigit():
+            recipient_id = int(recipient_input)
+            await state.update_data(recipient_id=recipient_id)
+            await state.set_state(TransferStates.confirming)
+            
+            data = await state.get_data()
+            selected_item = data['selected_item']
+            
+            try:
+                recipient_user = await bot.get_chat(recipient_id)
+                recipient_name = recipient_user.first_name
+            except:
+                recipient_name = f"ID {recipient_id}"
+            
+            await message.answer(
+                f"🎯 Получатель: {recipient_name}\n"
+                f"🎁 Предмет: {selected_item['emoji']} {selected_item['name']}\n\n"
+                f"⚠️ Внимание: передача необратима!\n"
+                f"✅ Для подтверждения введите 'да'\n"
+                f"❌ Для отмены введите 'нет'"
+            )
+        
+        else:
+            await message.answer("❌ Неверный формат! Введите @username или ID пользователя")
+    
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при обработке получателя: {e}")
+
+@router.message(TransferStates.confirming)
+async def process_confirmation(message: Message, state: FSMContext):
+    confirmation = message.text.lower()
+    
+    if confirmation in ['да', 'yes', 'y', 'д']:
+        data = await state.get_data()
+        
+        if 'recipient_id' not in data:
+            await message.answer("❌ Поиск по username временно недоступен. Используйте ID пользователя.")
+            await state.clear()
             return
         
-        game_type = self.user_bets[user_id]['game']
+        item_index = data['selected_item_index']
+        recipient_id = data['recipient_id']
         
-        try:
-            if game_type == 'coinflip':
-                bet = int(text)
-                if bet <= 0:
-                    await update.message.reply_text("❌ Ставка должна быть положительной!")
-                    return
-                
-                if 'choice' not in self.user_bets[user_id]:
-                    await update.message.reply_text("❌ Сначала выберите сторону монеты!")
-                    return
-                
-                choice = self.user_bets[user_id]['choice']
-                result = self.games.coin_flip(user_id, bet, choice)
-                
-                if result['success']:
-                    if result['win']:
-                        await update.message.reply_text(
-                            f"🎉 Поздравляем! Выпал {result['result']}\n"
-                            f"💰 Вы выиграли: {result['win_amount']} монет\n"
-                            f"💵 Новый баланс: {result['new_balance']} монет"
-                        )
-                    else:
-                        await update.message.reply_text(
-                            f"😞 Увы! Выпал {result['result']}\n"
-                            f"💸 Вы проиграли: {result['lost_amount']} монет\n"
-                            f"💵 Новый баланс: {result['new_balance']} монет"
-                        )
-                else:
-                    await update.message.reply_text(result['message'])
-                
-                del self.user_bets[user_id]
+        result = shop_system.transfer_item(message.from_user.id, recipient_id, item_index)
+        
+        if result['success']:
+            try:
+                recipient_user = await bot.get_chat(recipient_id)
+                await bot.send_message(
+                    recipient_id,
+                    f"🎁 Вам передали NFT!\n\n"
+                    f"{result['item_name']}\n"
+                    f"📤 От: {message.from_user.first_name} (@{message.from_user.username if message.from_user.username else 'N/A'})\n\n"
+                    f"🎒 Посмотреть коллекцию: /inventory"
+                )
+            except:
+                pass
             
-            elif game_type == 'slots':
-                bet = int(text)
-                if bet <= 0:
-                    await update.message.reply_text("❌ Ставка должна быть положительной!")
-                    return
-                
-                result = self.games.slots(user_id, bet)
-                
-                if result['success']:
-                    reels_text = ' | '.join(result['reels'])
-                    if result['win']:
-                        await update.message.reply_text(
-                            f"🎰 {reels_text} 🎰\n"
-                            f"🎉 ДЖЕКПОТ! x{result['multiplier']}\n"
-                            f"💰 Выигрыш: {result['win_amount']} монет\n"
-                            f"💵 Баланс: {result['new_balance']} монет"
-                        )
-                    else:
-                        await update.message.reply_text(
-                            f"🎰 {reels_text} 🎰\n"
-                            f"😞 Повезет в следующий раз!\n"
-                            f"💸 Проигрыш: {result['lost_amount']} монет\n"
-                            f"💵 Баланс: {result['new_balance']} монет"
-                        )
-                else:
-                    await update.message.reply_text(result['message'])
-                
-                del self.user_bets[user_id]
-            
-            elif game_type == 'dice':
-                parts = text.split()
-                if len(parts) != 2:
-                    await update.message.reply_text("❌ Формат: ставка предсказание\nПример: 100 3")
-                    return
-                
-                bet = int(parts[0])
-                prediction = int(parts[1])
-                
-                result = self.games.dice_game(user_id, bet, prediction)
-                
-                if result['success']:
-                    if result['win']:
-                        await update.message.reply_text(
-                            f"🎲 Выпало: {result['dice_roll']}\n"
-                            f"🎉 Поздравляем! Угадали!\n"
-                            f"💰 Выигрыш: {result['win_amount']} монет\n"
-                            f"💵 Баланс: {result['new_balance']} монет"
-                        )
-                    else:
-                        await update.message.reply_text(
-                            f"🎲 Выпало: {result['dice_roll']}\n"
-                            f"😞 Не угадали!\n"
-                            f"💸 Проигрыш: {result['lost_amount']} монет\n"
-                            f"💵 Баланс: {result['new_balance']} монет"
-                        )
-                else:
-                    await update.message.reply_text(result['message'])
-                
-                del self.user_bets[user_id]
-        
-        except ValueError:
-            await update.message.reply_text("❌ Неверный формат ставки!")
-        except Exception as e:
-            await update.message.reply_text("❌ Произошла ошибка!")
-            logging.error(f"Error in handle_bet: {e}")
-    
-    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        data = query.data
-        
-        if data.startswith('coin_'):
-            choice = data.split('_')[1]
-            self.user_bets[user_id]['choice'] = choice
-            await query.edit_message_text(
-                f"✅ Выбрана сторона: {'🦅 Орел' if choice == 'орел' else '🪙 Решка'}\n"
-                f"📝 Теперь введите ставку:"
+            await message.answer(
+                f"✅ {result['message']}\n"
+                f"🎯 Получатель уведомлен о передаче!"
             )
+        else:
+            await message.answer(result['message'])
     
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logging.error(f"Exception while handling an update: {context.error}")
+    elif confirmation in ['нет', 'no', 'n', 'н']:
+        await message.answer("❌ Передача отменена.")
+    
+    else:
+        await message.answer("❌ Введите 'да' для подтверждения или 'нет' для отмены")
+        return
+    
+    await state.clear()
+
+# === ИГРЫ ===
+@router.message(Command("coinflip"))
+async def cmd_coinflip(message: Message, state: FSMContext):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🦅 Орел", callback_data="coin_орел")],
+        [InlineKeyboardButton(text="🪙 Решка", callback_data="coin_решка")]
+    ])
+    
+    await state.set_state(GameStates.waiting_bet)
+    await message.answer(
+        "🎯 Выберите сторону монеты:",
+        reply_markup=keyboard
+    )
+
+@router.callback_query(F.data.startswith("coin_"))
+async def process_coin_choice(callback: CallbackQuery, state: FSMContext):
+    choice = callback.data.split("_")[1]
+    user_choices[callback.from_user.id] = {'game': 'coinflip', 'choice': choice}
+    
+    await state.set_state(GameStates.waiting_bet)
+    await callback.message.edit_text(
+        f"✅ Выбрана сторона: {'🦅 Орел' if choice == 'орел' else '🪙 Решка'}\n"
+        f"📝 Теперь введите ставку:"
+    )
+    await callback.answer()
+
+@router.message(Command("slots"))
+async def cmd_slots(message: Message, state: FSMContext):
+    await state.set_state(GameStates.waiting_bet)
+    user_choices[message.from_user.id] = {'game': 'slots'}
+    await message.answer("🎰 Введите ставку для игровых автоматов:\nПример: 50")
+
+@router.message(Command("dice"))
+async def cmd_dice(message: Message, state: FSMContext):
+    await state.set_state(GameStates.waiting_dice_bet)
+    user_choices[message.from_user.id] = {'game': 'dice'}
+    await message.answer("🎲 Введите ставку и предсказание (1-6):\nПример: 100 3")
+
+@router.message(GameStates.waiting_bet)
+async def process_bet(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    if user_id not in user_choices:
+        await message.answer("❌ Сначала выберите игру!")
+        await state.clear()
+        return
+    
+    game_data = user_choices[user_id]
+    
+    try:
+        if game_data['game'] == 'coinflip':
+            bet = int(message.text)
+            if bet <= 0:
+                await message.answer("❌ Ставка должна быть положительной!")
+                return
+            
+            choice = game_data['choice']
+            result = games.coin_flip(user_id, bet, choice)
+            
+            if result['success']:
+                if result['win']:
+                    await message.answer(
+                        f"🎉 Поздравляем! Выпал {result['result']}\n"
+                        f"💰 Вы выиграли: {result['win_amount']} монет\n"
+                        f"💵 Новый баланс: {result['new_balance']} монет"
+                    )
+                else:
+                    await message.answer(
+                        f"😞 Увы! Выпал {result['result']}\n"
+                        f"💸 Вы проиграли: {result['lost_amount']} монет\n"
+                        f"💵 Новый баланс: {result['new_balance']} монет"
+                    )
+            else:
+                await message.answer(result['message'])
+            
+            del user_choices[user_id]
+            await state.clear()
+        
+        elif game_data['game'] == 'slots':
+            bet = int(message.text)
+            if bet <= 0:
+                await message.answer("❌ Ставка должна быть положительной!")
+                return
+            
+            result = games.slots(user_id, bet)
+            
+            if result['success']:
+                reels_text = ' | '.join(result['reels'])
+                if result['win']:
+                    await message.answer(
+                        f"🎰 {reels_text} 🎰\n"
+                        f"🎉 ДЖЕКПОТ! x{result['multiplier']}\n"
+                        f"💰 Выигрыш: {result['win_amount']} монет\n"
+                        f"💵 Баланс: {result['new_balance']} монет"
+                    )
+                else:
+                    await message.answer(
+                        f"🎰 {reels_text} 🎰\n"
+                        f"😞 Повезет в следующий раз!\n"
+                        f"💸 Проигрыш: {result['lost_amount']} монет\n"
+                        f"💵 Баланс: {result['new_balance']} монет"
+                    )
+            else:
+                await message.answer(result['message'])
+            
+            del user_choices[user_id]
+            await state.clear()
+    
+    except ValueError:
+        await message.answer("❌ Неверный формат ставки!")
+    except Exception as e:
+        await message.answer("❌ Произошла ошибка!")
+        logging.error(f"Error in process_bet: {e}")
+        del user_choices[user_id]
+        await state.clear()
+
+@router.message(GameStates.waiting_dice_bet)
+async def process_dice_bet(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            await message.answer("❌ Формат: ставка предсказание\nПример: 100 3")
+            return
+        
+        bet = int(parts[0])
+        prediction = int(parts[1])
+        
+        if bet <= 0:
+            await message.answer("❌ Ставка должна быть положительной!")
+            return
+        
+        result = games.dice_game(user_id, bet, prediction)
+        
+        if result['success']:
+            if result['win']:
+                await message.answer(
+                    f"🎲 Выпало: {result['dice_roll']}\n"
+                    f"🎉 Поздравляем! Угадали!\n"
+                    f"💰 Выигрыш: {result['win_amount']} монет\n"
+                    f"💵 Баланс: {result['new_balance']} монет"
+                )
+            else:
+                await message.answer(
+                    f"🎲 Выпало: {result['dice_roll']}\n"
+                    f"😞 Не угадали!\n"
+                    f"💸 Проигрыш: {result['lost_amount']} монет\n"
+                    f"💵 Баланс: {result['new_balance']} монет"
+                )
+        else:
+            await message.answer(result['message'])
+        
+        if user_id in user_choices:
+            del user_choices[user_id]
+        await state.clear()
+    
+    except ValueError:
+        await message.answer("❌ Неверный формат! Используйте: ставка предсказание\nПример: 100 3")
+    except Exception as e:
+        await message.answer("❌ Произошла ошибка!")
+        logging.error(f"Error in process_dice_bet: {e}")
+        if user_id in user_choices:
+            del user_choices[user_id]
+        await state.clear()
+
+# === АДМИН КОМАНДЫ ===
+@router.message(Command("admin_promo"))
+async def cmd_admin_promo(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer(
+            "⚙️ Создание промокода (Админ)\n\n"
+            "Использование: /admin_promo [код] [награда] [лимит=100] [дни=30]\n"
+            "Пример: /admin_promo NEWYEAR 500 50 7"
+        )
+        return
+    
+    promo_code = args[1].upper().strip()
+    reward = int(args[2])
+    uses_limit = int(args[3]) if len(args) > 3 else 100
+    expires_days = int(args[4]) if len(args) > 4 else 30
+    
+    success = promo_system.create_promo(promo_code, reward, uses_limit, expires_days)
+    
+    if success:
+        await message.answer(
+            f"✅ Промокод создан!\n\n"
+            f"🎫 Код: {promo_code}\n"
+            f"💰 Награда: {reward} монет\n"
+            f"📊 Лимит: {uses_limit} использований\n"
+            f"⏰ Срок: {expires_days} дней"
+        )
+    else:
+        await message.answer("❌ Промокод уже существует!")
+
+@router.message(Command("admin_promo_list"))
+async def cmd_admin_promo_list(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    promos = promo_system.get_all_promos()
+    
+    if not promos:
+        await message.answer("📭 Нет активных промокодов")
+        return
+    
+    promo_text = "📋 АКТИВНЫЕ ПРОМОКОДЫ:\n\n"
+    for code, data in promos.items():
+        import datetime
+        expires = datetime.datetime.fromisoformat(data['expires_at'])
+        days_left = (expires - datetime.datetime.now()).days
+        
+        promo_text += (
+            f"🎫 {code}\n"
+            f"💰 {data['reward']} монет | 🎯 {data['uses_count']}/{data['uses_limit']}\n"
+            f"⏰ Осталось дней: {days_left}\n"
+            f"────────────────────\n"
+        )
+    
+    await message.answer(promo_text)
+
+@router.message(Command("admin_add_item"))
+async def cmd_admin_add_item(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    args = message.text.split()
+    if len(args) < 5:
+        await message.answer(
+            "🛍️ Добавление предмета в магазин (Админ)\n\n"
+            "Использование: /admin_add_item id название цена количество\n"
+            "Дополнительно: описание эмодзи\n\n"
+            "Пример: /admin_add_item dragon1 Золотой_Дракон 1000 10\n"
+            "Пример с опцией: /admin_add_item sword1 Меч 500 20 Острый_меч ⚔️\n\n"
+            "💡 Используй подчеркивания _ вместо пробелов"
+        )
+        return
+    
+    try:
+        item_id = str(args[1])
+        name = str(args[2]).replace('_', ' ')
+        price = int(args[3])
+        quantity = int(args[4])
+        
+        description = ""
+        emoji = "🎁"
+        
+        if len(args) > 5:
+            description = str(args[5]).replace('_', ' ')
+        if len(args) > 6:
+            emoji = str(args[6])
+        
+        if price <= 0:
+            await message.answer("❌ Цена должна быть положительной!")
+            return
+        
+        if quantity <= 0:
+            await message.answer("❌ Количество должно быть положительным!")
+            return
+        
+        success = shop_system.add_item(item_id, name, price, quantity, description, emoji)
+        
+        if success:
+            response_text = (
+                f"✅ Предмет добавлен в магазин!\n\n"
+                f"{emoji} {name}\n"
+                f"💰 Цена: {price} монет\n"
+                f"📦 Количество: {quantity} шт.\n"
+                f"🆔 ID: {item_id}"
+            )
+            if description:
+                response_text += f"\n📝 Описание: {description}"
+            
+            await message.answer(response_text)
+        else:
+            await message.answer("❌ Предмет с таким ID уже существует!")
+    
+    except ValueError:
+        await message.answer("❌ Ошибка: цена и количество должны быть числами!")
+    except IndexError:
+        await message.answer("❌ Ошибка: недостаточно аргументов!")
+    except Exception as e:
+        await message.answer(f"❌ Неожиданная ошибка: {str(e)}")
+
+@router.message(Command("admin_shop_list"))
+async def cmd_admin_shop_list(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    shop_items = shop_system.get_shop_items()
+    
+    if not shop_items:
+        await message.answer("🛍️ Магазин пуст")
+        return
+    
+    shop_text = "🛍️ ПРЕДМЕТЫ В МАГАЗИНЕ:\n\n"
+    for item_id, item in shop_items.items():
+        shop_text += (
+            f"{item['emoji']} {item['name']}\n"
+            f"🆔 ID: {item_id}\n"
+            f"💰 Цена: {item['price']} монет\n"
+            f"📦 Осталось: {item['quantity']} | Продано: {item['sold']}\n"
+            f"📝 {item['description']}\n"
+            f"────────────────────\n"
+        )
+    
+    await message.answer(shop_text)
 
 # === ЗАПУСК БОТА ===
-def main():
-    casino_bot = CasinoBot()
-    
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Команды
-    application.add_handler(CommandHandler("start", casino_bot.start))
-    application.add_handler(CommandHandler("profile", casino_bot.profile))
-    application.add_handler(CommandHandler("top", casino_bot.top))
-    application.add_handler(CommandHandler("promo", casino_bot.promo))
-    application.add_handler(CommandHandler("shop", casino_bot.shop))
-    application.add_handler(CommandHandler("inventory", casino_bot.inventory))
-    application.add_handler(CommandHandler("transfer", casino_bot.transfer))
-    
-    # Админ команды
-    application.add_handler(CommandHandler("admin_promo", casino_bot.admin_promo))
-    application.add_handler(CommandHandler("admin_promo_list", casino_bot.admin_promo_list))
-    application.add_handler(CommandHandler("admin_add_item", casino_bot.admin_add_item))
-    application.add_handler(CommandHandler("admin_shop_list", casino_bot.admin_shop_list))
-    
-    # Игры
-    application.add_handler(CommandHandler("coinflip", casino_bot.coinflip))
-    application.add_handler(CommandHandler("slots", casino_bot.slots))
-    application.add_handler(CommandHandler("dice", casino_bot.dice_game))
-    
-    # Обработчики покупки
-    application.add_handler(MessageHandler(filters.Regex(r'^/buy_\w+'), casino_bot.handle_buy_command))
-    
-    # Обработчики
-    application.add_handler(CallbackQueryHandler(casino_bot.button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, casino_bot.handle_bet))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, casino_bot.handle_transfer))
-    
-    application.add_error_handler(casino_bot.error_handler)
+async def main():
+    dp.include_router(router)
     
     print("🎰 Казино бот запущен!")
     print(f"⚙️ Админ ID: {ADMIN_ID}")
-    application.run_polling()
+    
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())

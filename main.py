@@ -12,23 +12,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # === КОНФИГУРАЦИЯ ===
-BOT_TOKEN = "8382913453:AAGD3phfvwnm4f0wjAmBljS8lN-ZLHM5MHA"
+BOT_TOKEN = "8382913453:AAFWSSqUe_EIyiavu6y2siD8a08iA0Tn9kU"
 ADMIN_ID = 6539341659
 DATABASE_FILE = "casino_data.json"
 PROMO_FILE = "promo_codes.json"
 SHOP_FILE = "shop_items.json"
 INVENTORY_FILE = "inventory.json"
 BROADCAST_FILE = "broadcast_messages.json"
-LOG_FILE = "casino_bot.log"
 
-# Настройка логирования
+# Настройка логирования только в консоль
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO
 )
 
 # === СОСТОЯНИЯ FSM ===
@@ -706,6 +701,7 @@ class CasinoBot:
         
         welcome_text = f"""
 🎰 Добро пожаловать в Казино Бот, {user.first_name}!
+Наш канал с промокодами: 
 
 💰 Начальный баланс: 1000 монет
 
@@ -1573,4 +1569,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

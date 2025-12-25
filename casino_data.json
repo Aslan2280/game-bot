@@ -1,12 +1,15 @@
 {
   "6539341659": {
-    "balance": 1000004999,
+    "balance": 10000010000,
     "level": 1,
-    "games_played": 6,
-    "wins": 2,
+    "games_played": 15,
+    "wins": 3,
     "used_promocodes": [
       "WELCOME",
-      "30НОЯБРЯ"
+      "30НОЯБРЯ",
+      "16DECEMBER",
+      "ADMIN1",
+      "10К"
     ]
   },
   "6589011383": {
@@ -31,5 +34,14 @@
     "games_played": 2,
     "wins": 2,
     "used_promocodes": []
+  },
+  "7524441124": {
+    "balance": 0,
+    "level": 1,
+    "games_played": 0,
+    "wins": 0,
+    "used_promocodes": [
+      "10К"
+    ]
   }
 }

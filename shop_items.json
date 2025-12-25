@@ -16,5 +16,14 @@
     "description": "Lol Pop",
     "emoji": "🍭",
     "created_at": "1764487781.8266792"
+  },
+  "LolPop": {
+    "name": "Lol Pop",
+    "price": 2500,
+    "quantity": 5,
+    "sold": 5,
+    "description": "Выпущенно 10шт. Первый не тестовый NFT!",
+    "emoji": "🍭",
+    "created_at": "1765914691.706092"
   }
 }

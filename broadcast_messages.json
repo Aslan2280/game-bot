@@ -8,10 +8,19 @@
       "failed_count": 0,
       "timestamp": "1764445953.9034176",
       "total_users": 1
+    },
+    {
+      "id": 2,
+      "message": "Сервер перезапущен🔄\nПромокод  /promo 16DECEMBER награда 5к, активаций 10\nНовый NFT: Lol Pop, цена 2,5к кол-во 10 /buy_LolPop",
+      "sent_by": 6539341659,
+      "sent_count": 4,
+      "failed_count": 0,
+      "timestamp": "1765914691.706092",
+      "total_users": 4
     }
   ],
   "stats": {
-    "total_broadcasts": 1,
-    "total_messages_sent": 1
+    "total_broadcasts": 2,
+    "total_messages_sent": 5
   }
 }

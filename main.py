@@ -3,7 +3,9 @@ import os
 import random
 import logging
 import asyncio
+import datetime
 from typing import Dict, Any, Optional, List
+from contextlib import suppress
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command, CommandStart
@@ -37,6 +39,9 @@ class BroadcastStates(StatesGroup):
     confirming = State()
 
 class BetStates(StatesGroup):
+    waiting_bet = State()
+
+class GoldGameStates(StatesGroup):
     waiting_bet = State()
 
 # === СИСТЕМА РАССЫЛКИ ===
@@ -180,7 +185,6 @@ class PromoCodeSystem:
         if code in promos:
             return False
         
-        import datetime
         expires = (datetime.datetime.now() + datetime.timedelta(days=expires_days)).isoformat()
         
         promos[code] = {
@@ -204,7 +208,6 @@ class PromoCodeSystem:
         promo = promos[code]
         user_data = db.get_user(user_id)
         
-        import datetime
         expires_at = datetime.datetime.fromisoformat(promo['expires_at'])
         if datetime.datetime.now() > expires_at:
             return {'success': False, 'message': '❌ Промокод просрочен!'}
@@ -271,7 +274,7 @@ class ShopSystem:
             with open(self.inventory_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
-            return {}
+        return {}
     
     def _write_inventory(self, data: Dict):
         with open(self.inventory_file, 'w', encoding='utf-8') as f:
@@ -505,7 +508,7 @@ class MinesGame:
         self.db = db
         self.active_games = {}
     
-    def start_game(self, user_id: int, bet: int) -> Dict[str, Any]:
+    def start_game(self, user_id: int, bet: int, mines_count: int = 3) -> Dict[str, Any]:
         user_data = self.db.get_user(user_id)
         
         if user_data['balance'] < bet:
@@ -514,10 +517,13 @@ class MinesGame:
         if bet <= 0:
             return {'success': False, 'message': '❌ Ставка должна быть положительной!'}
         
+        if mines_count < 1 or mines_count > 24:
+            return {'success': False, 'message': '❌ Количество мин должно быть от 1 до 24!'}
+        
         field = [['⬜' for _ in range(5)] for _ in range(5)]
         
         mines_positions = []
-        while len(mines_positions) < 3:
+        while len(mines_positions) < mines_count:
             pos = (random.randint(0, 4), random.randint(0, 4))
             if pos not in mines_positions:
                 mines_positions.append(pos)
@@ -535,6 +541,7 @@ class MinesGame:
             'bet': bet,
             'field': field,
             'mines': mines_positions,
+            'mines_count': mines_count,
             'safe_positions': safe_positions,
             'opened_cells': [],
             'current_multiplier': 1.0,
@@ -552,6 +559,7 @@ class MinesGame:
             'success': True,
             'bet': bet,
             'field': field,
+            'mines_count': mines_count,
             'current_balance': new_balance,
             'game_data': game_data
         }
@@ -682,6 +690,174 @@ class MinesGame:
         
         return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+# === ИГРА "ЗОЛОТО" ===
+class GoldGame:
+    def __init__(self, db: JSONDatabase):
+        self.db = db
+        self.active_games = {}
+        self.multiplier_levels = [
+            (2, "2x"), (4, "4x"), (8, "8x"), (16, "16x"), (32, "32x"),
+            (64, "64x"), (128, "128x"), (256, "256x"), (512, "512x"),
+            (1024, "1024x"), (2048, "2048x"), (4096, "4096x")
+        ]
+    
+    def start_game(self, user_id: int, bet: int) -> Dict[str, Any]:
+        user_data = self.db.get_user(user_id)
+        
+        if user_data['balance'] < bet:
+            return {'success': False, 'message': '❌ Недостаточно средств!'}
+        
+        if bet <= 0:
+            return {'success': False, 'message': '❌ Ставка должна быть положительной!'}
+        
+        crash_time = random.uniform(3.0, 15.0)
+        
+        game_data = {
+            'bet': bet,
+            'start_time': datetime.datetime.now(),
+            'crash_time': crash_time,
+            'current_level': 0,
+            'cashed_out': False,
+            'cashed_at': None,
+            'cashed_multiplier': 1.0,
+            'game_over': False
+        }
+        
+        self.active_games[user_id] = game_data
+        
+        new_balance = user_data['balance'] - bet
+        self.db.update_user(user_id, balance=new_balance)
+        
+        return {
+            'success': True,
+            'bet': bet,
+            'start_time': game_data['start_time'],
+            'crash_time': crash_time,
+            'current_balance': new_balance,
+            'message': f'🎮 Игра "Золото" начата!\n💰 Ставка: {bet} mDrops\n\n⏱️ Множитель растёт...'
+        }
+    
+    def get_current_multiplier(self, user_id: int) -> Dict[str, Any]:
+        if user_id not in self.active_games:
+            return {'success': False, 'message': '❌ Нет активной игры!'}
+        
+        game_data = self.active_games[user_id]
+        
+        if game_data['game_over']:
+            return {'success': True, 'game_over': True, 'cashed_out': game_data['cashed_out']}
+        
+        elapsed = (datetime.datetime.now() - game_data['start_time']).total_seconds()
+        
+        level = 0
+        for i, (mult, _) in enumerate(self.multiplier_levels):
+            if elapsed >= i * 0.5:
+                level = i
+            else:
+                break
+        
+        game_data['current_level'] = min(level, len(self.multiplier_levels) - 1)
+        
+        if elapsed >= game_data['crash_time']:
+            return self._handle_crash(user_id)
+        
+        current_mult = self.multiplier_levels[game_data['current_level']][0]
+        next_mult = self.multiplier_levels[min(game_data['current_level'] + 1, len(self.multiplier_levels) - 1)][0]
+        progress = (elapsed % 0.5) / 0.5 if elapsed < game_data['crash_time'] else 1.0
+        
+        return {
+            'success': True,
+            'elapsed': elapsed,
+            'current_level': game_data['current_level'],
+            'current_multiplier': current_mult,
+            'current_multiplier_display': self.multiplier_levels[game_data['current_level']][1],
+            'next_multiplier': next_mult,
+            'progress': progress,
+            'time_left': max(0, game_data['crash_time'] - elapsed),
+            'potential_win': int(game_data['bet'] * current_mult)
+        }
+    
+    def _handle_crash(self, user_id: int) -> Dict[str, Any]:
+        game_data = self.active_games[user_id]
+        game_data['game_over'] = True
+        
+        if not game_data['cashed_out']:
+            del self.active_games[user_id]
+            return {
+                'success': True,
+                'game_over': True,
+                'cashed_out': False,
+                'won': False,
+                'message': '💥 КРАХ! Вы не успели забрать выигрыш!'
+            }
+        
+        return {'success': True, 'game_over': True, 'cashed_out': True}
+    
+    def cashout(self, user_id: int) -> Dict[str, Any]:
+        if user_id not in self.active_games:
+            return {'success': False, 'message': '❌ Нет активной игры!'}
+        
+        game_data = self.active_games[user_id]
+        
+        if game_data['game_over']:
+            return {'success': False, 'message': '❌ Игра уже завершена!'}
+        
+        if game_data['cashed_out']:
+            return {'success': False, 'message': '❌ Вы уже забрали выигрыш!'}
+        
+        result = self.get_current_multiplier(user_id)
+        if not result['success'] or result.get('game_over', False):
+            return {'success': False, 'message': '❌ Не удалось получить текущий множитель!'}
+        
+        current_mult = result['current_multiplier']
+        win_amount = int(game_data['bet'] * current_mult)
+        
+        user_data = self.db.get_user(user_id)
+        new_balance = user_data['balance'] + win_amount
+        self.db.update_user(user_id, balance=new_balance)
+        
+        self.db.update_user(
+            user_id,
+            games_played=user_data['games_played'] + 1,
+            wins=user_data['wins'] + 1
+        )
+        
+        game_data['cashed_out'] = True
+        game_data['cashed_at'] = datetime.datetime.now()
+        game_data['cashed_multiplier'] = current_mult
+        game_data['game_over'] = True
+        del self.active_games[user_id]
+        
+        return {
+            'success': True,
+            'won_amount': win_amount,
+            'multiplier': current_mult,
+            'multiplier_display': result['current_multiplier_display'],
+            'new_balance': new_balance,
+            'bet': game_data['bet'],
+            'message': f'🏆 Ты забрал выигрыш!\nСтавка: {game_data["bet"]} mDrops\nВыигрыш: {win_amount} mDrops ({result["current_multiplier_display"]})'
+        }
+    
+    def force_end_game(self, user_id: int):
+        if user_id in self.active_games:
+            user_data = self.db.get_user(user_id)
+            new_balance = user_data['balance'] + self.active_games[user_id]['bet']
+            self.db.update_user(user_id, balance=new_balance)
+            del self.active_games[user_id]
+    
+    def get_game_info(self, user_id: int) -> Optional[Dict]:
+        return self.active_games.get(user_id)
+    
+    def create_progress_bar(self, progress: float, length: int = 10) -> str:
+        filled = int(progress * length)
+        bar = '█' * filled + '░' * (length - filled)
+        return f"[{bar}] {progress*100:.1f}%"
+    
+    def create_multiplier_list(self) -> str:
+        lines = []
+        for mult, label in reversed(self.multiplier_levels):
+            lines.append(f"{mult:,} mDrops ({label})".replace(",", "."))
+        return "\n".join(lines)
+
 # === ОСНОВНОЙ КЛАСС БОТА ===
 class CasinoBot:
     def __init__(self):
@@ -690,9 +866,38 @@ class CasinoBot:
         self.promo_system = PromoCodeSystem()
         self.shop_system = ShopSystem()
         self.mines_game = MinesGame(self.db)
+        self.gold_game = GoldGame(self.db)
         self.broadcast_system = BroadcastSystem()
         self.user_bets = {}
         self.user_choices = {}
+        self.active_gold_messages = {}
+        
+        self.game_commands = {
+            'монета': self.handle_coin_command,
+            'монетка': self.handle_coin_command,
+            'орёл': self.handle_coin_command,
+            'орел': self.handle_coin_command,
+            'решка': self.handle_coin_command,
+            'coin': self.handle_coin_command,
+            'coinflip': self.handle_coin_command,
+            
+            'слоты': self.handle_slots_command,
+            'slots': self.handle_slots_command,
+            'автоматы': self.handle_slots_command,
+            
+            'кости': self.handle_dice_command,
+            'dice': self.handle_dice_command,
+            'кубик': self.handle_dice_command,
+            'кубики': self.handle_dice_command,
+            
+            'мины': self.handle_mines_command,
+            'mines': self.handle_mines_command,
+            'минное': self.handle_mines_command,
+            
+            'золото': self.handle_gold_command,
+            'gold': self.handle_gold_command,
+            'голд': self.handle_gold_command
+        }
 
     # === ОСНОВНЫЕ КОМАНДЫ ===
     async def start(self, message: Message):
@@ -706,10 +911,11 @@ class CasinoBot:
 💰 Начальный баланс: 1000 монет
 
 🎮 Доступные игры:
-• /coinflip - Орел и решка
-• /slots - Игровые автоматы  
-• /dice - Бросок кубика
-• /mines - Минное поле
+• /coinflip или "монета орёл [ставка]" - Орел и решка
+• /slots или "слоты [ставка]" - Игровые автоматы  
+• /dice или "кости [ставка] [число]" - Бросок кубика
+• /mines или "мины [ставка] [количество_мин]" - Минное поле
+• /gold или "золото [ставка]" - Золото (растущий множитель)
 
 🛍️ Магазин: /shop
 📊 Статистика: /profile
@@ -748,9 +954,7 @@ class CasinoBot:
         top_text = "🏆 ТОП ИГРОКОВ:\n\n"
         for i, (user_id, user_data) in enumerate(top_users, 1):
             try:
-                # В aiogram нет прямого аналога get_chat для пользователей
                 name = f"Игрок {user_id}"
-                # Можно попробовать получить через бота, но это сложнее
             except:
                 name = f"Игрок {user_id}"
             
@@ -909,7 +1113,6 @@ class CasinoBot:
             
             if result['success']:
                 try:
-                    # Уведомление получателя
                     bot = message.bot
                     await bot.send_message(
                         recipient_id,
@@ -994,7 +1197,7 @@ class CasinoBot:
                         await message.answer(
                             f"😞 Увы! Выпал {result['result']}\n"
                             f"💸 Вы проиграли: {result['lost_amount']} монет\n"
-                            f"💵 Новый баланс: {result['new_balance']} монet"
+                            f"💵 Новый баланс: {result['new_balance']} монет"
                         )
                 else:
                     await message.answer(result['message'])
@@ -1088,9 +1291,10 @@ class CasinoBot:
         
         if not message.text.split()[1:]:
             await message.answer(
-                "🎮 ИГРА 'МИННОЕ ПОЛЕ'\n\n"
+                "💣 ИГРА 'МИНЫ'\n\n"
                 "Правила:\n"
-                "• Поле 5x5 с 3 минами 💣\n"
+                "• Поле 5x5 с минами 💣\n"
+                "• Выберите количество мин (1-6)\n"
                 "• Нажимайте на клетки чтобы открыть их\n"
                 "• Каждая открытая клетка увеличивает множитель\n"
                 "• Заберите выигрыш в любой момент\n"
@@ -1100,42 +1304,59 @@ class CasinoBot:
                 "• 4 клетки: x3.0\n• 5 клеток: x5.0\n• 6 клеток: x7.0\n"
                 "• 7 клеток: x10.0\n• 8 клеток: x15.0\n• 9 клеток: x20.0\n"
                 "• 10 клеток: x30.0\n• 11 клеток: x50.0\n• 12+ клеток: x100.0\n\n"
-                "Использование: /mines [ставка]\n"
-                "Пример: /mines 100"
+                "Форматы:\n"
+                "/mines [ставка] [количество_мин]\n"
+                "мины [ставка] [количество_мин]\n"
+                "Пример: /mines 100 3\n"
+                "Пример: мины 200 2\n"
+                "Пример: мины 1.5к 4"
             )
             return
         
         try:
-            bet = int(message.text.split()[1])
-            result = self.mines_game.start_game(user.id, bet)
-            
-            if not result['success']:
-                await message.answer(result['message'])
-                return
-            
-            game_data = result['game_data']
-            keyboard = self.mines_game.create_keyboard(game_data['field'])
-            
-            message_text = (
-                f"🎮 Игра 'Минное поле' начата!\n"
-                f"💰 Ставка: {bet} монет\n"
-                f"💣 Мин на поле: 3\n"
-                f"🎯 Открыто клеток: 0\n"
-                f"📈 Текущий множитель: x1.0\n"
-                f"💎 Текущий выигрыш: 0 монет\n\n"
-                f"🟦 - закрытые клетки\n"
-                f"🟩 - безопасные клетки\n"
-                f"💣 - мины\n\n"
-                f"💡 Нажимайте на клетки чтобы открыть их!"
-            )
-            
-            await message.answer(
-                message_text,
-                reply_markup=keyboard
-            )
-            
+            parts = message.text.split()
+            if len(parts) >= 2:
+                bet_text = parts[1]
+                mines_count = 3
+                if len(parts) >= 3:
+                    try:
+                        mines_count = int(parts[2])
+                        if mines_count < 1 or mines_count > 6:
+                            await message.answer("❌ Количество мин должно быть от 1 до 6!")
+                            return
+                    except ValueError:
+                        pass
+                
+                bet = self._parse_bet(bet_text)
+                result = self.mines_game.start_game(user.id, bet, mines_count)
+                
+                if not result['success']:
+                    await message.answer(result['message'])
+                    return
+                
+                game_data = result['game_data']
+                keyboard = self.mines_game.create_keyboard(game_data['field'])
+                
+                message_text = (
+                    f"💣 МИНЫ (мин: {mines_count})\n\n"
+                    f"💰 Ставка: {bet} монет\n"
+                    f"💣 Мин на поле: {mines_count}\n"
+                    f"🎯 Открыто клеток: 0\n"
+                    f"📈 Текущий множитель: x1.0\n"
+                    f"💎 Текущий выигрыш: 0 монет\n\n"
+                    f"🟦 - закрытые клетки\n"
+                    f"🟩 - безопасные клетки\n"
+                    f"💣 - мины\n\n"
+                    f"💡 Нажимайте на клетки чтобы открыть их!"
+                )
+                
+                await message.answer(
+                    message_text,
+                    reply_markup=keyboard
+                )
+                
         except ValueError:
-            await message.answer("❌ Неверная ставка! Используйте: /mines 100")
+            await message.answer("❌ Неверная ставка! Используйте: /mines 100 или мины 1.5к 3")
     
     async def handle_mines_callback(self, callback: CallbackQuery):
         user_id = callback.from_user.id
@@ -1143,7 +1364,7 @@ class CasinoBot:
         
         if data == "mines_new":
             await callback.message.edit_text(
-                "🎮 Для начала новой игры введите:\n/mines [ставка]\n\nПример: /mines 100"
+                "🎮 Для начала новой игры введите:\n/mines [ставка] [количество_мин]\n\nПример: /mines 100 3"
             )
             return
         
@@ -1200,7 +1421,7 @@ class CasinoBot:
                 keyboard = self.mines_game.create_keyboard(result['field'])
                 
                 message_text = (
-                    f"🎮 Игра 'Минное поле'\n"
+                    f"💣 МИНЫ\n\n"
                     f"💰 Ставка: {self.mines_game.active_games[user_id]['bet']} монет\n"
                     f"🎯 Открыто клеток: {result['opened_count']}/{result['max_cells']}\n"
                     f"📈 Текущий множитель: x{result['multiplier']}\n"
@@ -1216,6 +1437,529 @@ class CasinoBot:
                 )
         
         await callback.answer()
+    
+    # === ИГРА "ЗОЛОТО" ===
+    async def gold_game_start(self, message: Message, state: FSMContext):
+        user = message.from_user
+        
+        if not message.text.split()[1:]:
+            await message.answer(
+                "⛏️ ИГРА 'ЗОЛОТО'\n\n"
+                "Правила:\n"
+                "• Сделайте ставку\n"
+                "• Множитель начинает расти: 2x → 4x → 8x → ... → 4096x\n"
+                "• Нажмите 'Забрать выигрыш' в любой момент\n"
+                "• Если не успеете до 'краха' — потеряете ставку\n\n"
+                "Множители:\n" +
+                self.gold_game.create_multiplier_list() +
+                "\n\nФорматы:\n"
+                "/gold [ставка]\n"
+                "золото [ставка]\n"
+                "Пример: /gold 100\n"
+                "Пример: золото 2.5к\n"
+                "Пример: gold 1к"
+            )
+            return
+        
+        try:
+            bet_text = message.text.split()[1].lower()
+            bet = self._parse_bet(bet_text)
+            
+            if bet <= 0:
+                await message.answer("❌ Ставка должна быть положительной!")
+                return
+            
+            result = self.gold_game.start_game(user.id, bet)
+            
+            if not result['success']:
+                await message.answer(result['message'])
+                return
+            
+            keyboard = [
+                [InlineKeyboardButton(text="🏆 Забрать выигрыш", callback_data="gold_cashout")],
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="gold_refresh")],
+                [InlineKeyboardButton(text="❌ Завершить игру", callback_data="gold_cancel")]
+            ]
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            
+            await message.answer(
+                f"⛏️ ЗОЛОТО\n\n"
+                f"💰 Ставка: {bet} mDrops\n"
+                f"🎯 Текущий множитель: 1x\n"
+                f"💎 Потенциальный выигрыш: {bet} mDrops\n"
+                f"⏱️ Игра началась...\n\n"
+                f"Нажмите 'Обновить' чтобы увидеть текущий множитель",
+                reply_markup=reply_markup
+            )
+            
+            self.active_gold_messages[user.id] = message.message_id + 1
+            asyncio.create_task(self._update_gold_game(message.chat.id, user.id))
+            
+        except ValueError:
+            await message.answer("❌ Неверная ставка! Используйте: /gold 100 или золото 2.5к")
+    
+    async def _update_gold_game(self, chat_id: int, user_id: int):
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                
+                result = self.gold_game.get_current_multiplier(user_id)
+                
+                if not result['success'] or result.get('game_over', False):
+                    break
+                
+                keyboard = [
+                    [InlineKeyboardButton(text="🏆 Забрать выигрыш", callback_data="gold_cashout")],
+                    [InlineKeyboardButton(text="🔄 Обновить", callback_data="gold_refresh")],
+                    [InlineKeyboardButton(text="❌ Завершить игру", callback_data="gold_cancel")]
+                ]
+                reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+                
+                progress_bar = self.gold_game.create_progress_bar(result['progress'])
+                
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=self.active_gold_messages.get(user_id),
+                        text=(
+                            f"⛏️ ЗОЛОТО\n\n"
+                            f"💰 Ставка: {self.gold_game.active_games[user_id]['bet']} mDrops\n"
+                            f"🎯 Текущий множитель: {result['current_multiplier_display']}\n"
+                            f"📈 Следующий: {result['next_multiplier']}x\n"
+                            f"💎 Потенциальный выигрыш: {result['potential_win']:,} mDrops\n"
+                            f"⏱️ Время до краха: {result['time_left']:.1f}с\n"
+                            f"{progress_bar}"
+                        ),
+                        reply_markup=reply_markup
+                    )
+                except:
+                    pass
+        except Exception as e:
+            logging.error(f"Error in gold game update: {e}")
+    
+    async def handle_gold_callback(self, callback: CallbackQuery):
+        user_id = callback.from_user.id
+        data = callback.data
+        
+        if data == "gold_cashout":
+            result = self.gold_game.cashout(user_id)
+            
+            if not result['success']:
+                await callback.answer(result['message'], show_alert=True)
+                return
+            
+            await callback.message.edit_text(
+                f"⛏️ ЗОЛОТО\n\n{result['message']}\n\n"
+                f"💰 Новый баланс: {result['new_balance']} mDrops\n"
+                f"🎮 Новая игра: /gold [ставка]"
+            )
+            
+            await callback.answer(f"Выигрыш: {result['won_amount']} mDrops!")
+        
+        elif data == "gold_refresh":
+            result = self.gold_game.get_current_multiplier(user_id)
+            
+            if not result['success']:
+                await callback.answer(result['message'], show_alert=True)
+                return
+            
+            if result.get('game_over', False):
+                if result.get('cashed_out', False):
+                    await callback.answer("Игра завершена, вы забрали выигрыш!", show_alert=True)
+                else:
+                    await callback.answer("💥 КРАХ! Игра завершена", show_alert=True)
+                return
+            
+            progress_bar = self.gold_game.create_progress_bar(result['progress'])
+            
+            keyboard = [
+                [InlineKeyboardButton(text="🏆 Забрать выигрыш", callback_data="gold_cashout")],
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="gold_refresh")],
+                [InlineKeyboardButton(text="❌ Завершить игру", callback_data="gold_cancel")]
+            ]
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+            
+            await callback.message.edit_text(
+                f"⛏️ ЗОЛОТО\n\n"
+                f"💰 Ставка: {self.gold_game.active_games[user_id]['bet']} mDrops\n"
+                f"🎯 Текущий множитель: {result['current_multiplier_display']}\n"
+                f"📈 Следующий: {result['next_multiplier']}x\n"
+                f"💎 Потенциальный выигрыш: {result['potential_win']:,} mDrops\n"
+                f"⏱️ Время до краха: {result['time_left']:.1f}с\n"
+                f"{progress_bar}",
+                reply_markup=reply_markup
+            )
+            
+            await callback.answer("Обновлено!")
+        
+        elif data == "gold_cancel":
+            self.gold_game.force_end_game(user_id)
+            await callback.message.edit_text(
+                "⛏️ Игра 'Золото' отменена\n\n"
+                "💰 Ставка возвращена на баланс\n"
+                "🎮 Новая игра: /gold [ставка]"
+            )
+            await callback.answer("Игра отменена")
+        
+        await callback.answer()
+    
+    # === КОМАНДЫ БЕЗ СЛЕША ===
+    async def handle_text_message(self, message: Message, state: FSMContext):
+        text = message.text.lower().strip()
+        
+        parts = text.split()
+        if not parts:
+            return
+        
+        command = parts[0]
+        
+        handler = self.game_commands.get(command)
+        if handler:
+            await handler(message, state)
+            return
+        
+        if len(parts) >= 2:
+            if parts[0] == 'монета' or parts[0] == 'coin':
+                if parts[1] in ['орёл', 'орел', 'решка', 'орла', 'решку']:
+                    await self.handle_coin_with_choice(message, state)
+                    return
+            
+            if parts[0] == 'игра' or parts[0] == 'game':
+                game_handler = self.game_commands.get(parts[1])
+                if game_handler:
+                    modified_text = ' '.join(parts[1:])
+                    message.text = modified_text
+                    await game_handler(message, state)
+                    return
+    
+    async def handle_coin_command(self, message: Message, state: FSMContext):
+        text = message.text.lower().strip()
+        parts = text.split()
+        
+        if len(parts) >= 2:
+            choice_text = parts[0] if parts[0] in ['орёл', 'орел', 'решка'] else parts[1]
+            bet_text = parts[1] if parts[0] in ['орёл', 'орел', 'решка'] else parts[2] if len(parts) >= 3 else None
+            
+            if choice_text in ['орёл', 'орел', 'решка'] and bet_text:
+                try:
+                    bet = self._parse_bet(bet_text)
+                    if bet <= 0:
+                        await message.answer("❌ Ставка должна быть положительной!")
+                        return
+                    
+                    user_id = message.from_user.id
+                    choice = 'орел' if choice_text in ['орёл', 'орел'] else 'решка'
+                    
+                    result = self.games.coin_flip(user_id, bet, choice)
+                    
+                    if result['success']:
+                        if result['win']:
+                            await message.answer(
+                                f"🪙 МОНЕТКА\n\n"
+                                f"🎯 Ставка: {bet} на {choice_text}\n"
+                                f"🎉 Выпал: {result['result']}\n"
+                                f"💰 Выигрыш: {result['win_amount']} монет\n"
+                                f"💵 Баланс: {result['new_balance']} монет"
+                            )
+                        else:
+                            await message.answer(
+                                f"🪙 МОНЕТКА\n\n"
+                                f"🎯 Ставка: {bet} на {choice_text}\n"
+                                f"😞 Выпал: {result['result']}\n"
+                                f"💸 Проигрыш: {result['lost_amount']} монет\n"
+                                f"💵 Баланс: {result['new_balance']} монет"
+                            )
+                    else:
+                        await message.answer(result['message'])
+                    
+                    return
+                    
+                except (ValueError, IndexError):
+                    pass
+        
+        await self.coinflip(message, state)
+    
+    async def handle_coin_with_choice(self, message: Message, state: FSMContext):
+        text = message.text.lower().strip()
+        parts = text.split()
+        
+        if len(parts) < 3:
+            await message.answer("❌ Формат: монета [орёл/решка] [ставка]\nПример: монета орёл 100")
+            return
+        
+        try:
+            choice_text = parts[1]
+            bet_text = parts[2]
+            
+            if choice_text not in ['орёл', 'орел', 'решка']:
+                await message.answer("❌ Выберите 'орёл' или 'решка'!")
+                return
+            
+            bet = self._parse_bet(bet_text)
+            if bet <= 0:
+                await message.answer("❌ Ставка должна быть положительной!")
+                return
+            
+            user_id = message.from_user.id
+            choice = 'орел' if choice_text in ['орёл', 'орел'] else 'решка'
+            
+            result = self.games.coin_flip(user_id, bet, choice)
+            
+            if result['success']:
+                if result['win']:
+                    await message.answer(
+                        f"🪙 МОНЕТКА\n\n"
+                        f"🎯 Ставка: {bet} на {choice_text}\n"
+                        f"🎉 Выпал: {result['result']}\n"
+                        f"💰 Выигрыш: {result['win_amount']} монет\n"
+                        f"💵 Баланс: {result['new_balance']} монет"
+                    )
+                else:
+                    await message.answer(
+                        f"🪙 МОНЕТКА\n\n"
+                        f"🎯 Ставка: {bet} на {choice_text}\n"
+                        f"😞 Выпал: {result['result']}\n"
+                        f"💸 Проигрыш: {result['lost_amount']} монет\n"
+                        f"💵 Баланс: {result['new_balance']} монет"
+                    )
+            else:
+                await message.answer(result['message'])
+                
+        except ValueError:
+            await message.answer("❌ Неверный формат ставки! Используйте: монета орёл 100")
+    
+    async def handle_slots_command(self, message: Message, state: FSMContext):
+        text = message.text.lower().strip()
+        parts = text.split()
+        
+        if len(parts) >= 2:
+            try:
+                bet_text = parts[1] if parts[0] in ['слоты', 'slots', 'автоматы'] else parts[0]
+                bet = self._parse_bet(bet_text)
+                
+                if bet <= 0:
+                    await message.answer("❌ Ставка должна быть положительной!")
+                    return
+                
+                user_id = message.from_user.id
+                result = self.games.slots(user_id, bet)
+                
+                if result['success']:
+                    reels_text = ' | '.join(result['reels'])
+                    if result['win']:
+                        await message.answer(
+                            f"🎰 АВТОМАТЫ\n\n"
+                            f"🎰 {reels_text}\n"
+                            f"🎉 ДЖЕКПОТ! x{result['multiplier']}\n"
+                            f"💰 Выигрыш: {result['win_amount']} монет\n"
+                            f"💵 Баланс: {result['new_balance']} монет"
+                        )
+                    else:
+                        await message.answer(
+                            f"🎰 АВТОМАТЫ\n\n"
+                            f"🎰 {reels_text}\n"
+                            f"😞 Повезет в следующий раз!\n"
+                            f"💸 Проигрыш: {result['lost_amount']} монет\n"
+                            f"💵 Баланс: {result['new_balance']} монет"
+                        )
+                else:
+                    await message.answer(result['message'])
+                
+                return
+                    
+            except (ValueError, IndexError):
+                pass
+        
+        await state.set_state(BetStates.waiting_bet)
+        await state.update_data(game='slots')
+        await message.answer("🎰 Введите ставку для игровых автоматов:\nПример: 50 или слоты 50")
+    
+    async def handle_dice_command(self, message: Message, state: FSMContext):
+        text = message.text.lower().strip()
+        parts = text.split()
+        
+        if len(parts) >= 2:
+            try:
+                if len(parts) >= 3:
+                    bet_text = parts[1]
+                    prediction_text = parts[2]
+                else:
+                    bet_text = parts[1]
+                    prediction_text = None
+                
+                bet = self._parse_bet(bet_text)
+                
+                if bet <= 0:
+                    await message.answer("❌ Ставка должна быть положительной!")
+                    return
+                
+                if prediction_text:
+                    try:
+                        prediction = int(prediction_text)
+                        if prediction < 1 or prediction > 6:
+                            await message.answer("❌ Предсказание должно быть от 1 до 6!")
+                            return
+                        
+                        user_id = message.from_user.id
+                        result = self.games.dice_game(user_id, bet, prediction)
+                        
+                        if result['success']:
+                            if result['win']:
+                                await message.answer(
+                                    f"🎲 КОСТИ\n\n"
+                                    f"🎯 Ставка: {bet} на {prediction}\n"
+                                    f"🎉 Выпало: {result['dice_roll']}\n"
+                                    f"💰 Выигрыш: {result['win_amount']} монет\n"
+                                    f"💵 Баланс: {result['new_balance']} монет"
+                                )
+                            else:
+                                await message.answer(
+                                    f"🎲 КОСТИ\n\n"
+                                    f"🎯 Ставка: {bet} на {prediction}\n"
+                                    f"😞 Выпало: {result['dice_roll']}\n"
+                                    f"💸 Проигрыш: {result['lost_amount']} монет\n"
+                                    f"💵 Баланс: {result['new_balance']} монет"
+                                )
+                        else:
+                            await message.answer(result['message'])
+                        
+                        return
+                        
+                    except ValueError:
+                        pass
+                
+            except (ValueError, IndexError):
+                pass
+        
+        await state.set_state(BetStates.waiting_bet)
+        await state.update_data(game='dice')
+        await message.answer("🎲 Введите ставку и предсказание (1-6):\nПример: 100 3 или кости 100 3")
+    
+    async def handle_mines_command(self, message: Message, state: FSMContext):
+        text = message.text.lower().strip()
+        parts = text.split()
+        
+        if len(parts) >= 2:
+            try:
+                bet_text = parts[1] if parts[0] in ['мины', 'mines', 'минное'] else parts[0]
+                bet = self._parse_bet(bet_text)
+                
+                if bet <= 0:
+                    await message.answer("❌ Ставка должна быть положительной!")
+                    return
+                
+                mines_count = 3
+                if len(parts) >= 3:
+                    try:
+                        mines_count = int(parts[2])
+                        if mines_count < 1 or mines_count > 6:
+                            await message.answer("❌ Количество мин должно быть от 1 до 6!")
+                            return
+                    except ValueError:
+                        pass
+                
+                await self._start_mines_game(message, bet, mines_count)
+                return
+                    
+            except (ValueError, IndexError):
+                pass
+        
+        await self.mines(message)
+    
+    async def _start_mines_game(self, message: Message, bet: int, mines_count: int = 3):
+        user = message.from_user
+        result = self.mines_game.start_game(user.id, bet, mines_count)
+        
+        if not result['success']:
+            await message.answer(result['message'])
+            return
+        
+        game_data = result['game_data']
+        keyboard = self.mines_game.create_keyboard(game_data['field'])
+        
+        message_text = (
+            f"💣 МИНЫ (мин: {mines_count})\n\n"
+            f"💰 Ставка: {bet} монет\n"
+            f"💣 Мин на поле: {mines_count}\n"
+            f"🎯 Открыто клеток: 0\n"
+            f"📈 Текущий множитель: x1.0\n"
+            f"💎 Текущий выигрыш: 0 монет\n\n"
+            f"🟦 - закрытые клетки\n"
+            f"🟩 - безопасные клетки\n"
+            f"💣 - мины\n\n"
+            f"💡 Нажимайте на клетки чтобы открыть их!"
+        )
+        
+        await message.answer(
+            message_text,
+            reply_markup=keyboard
+        )
+    
+    async def handle_gold_command(self, message: Message, state: FSMContext):
+        text = message.text.lower().strip()
+        parts = text.split()
+        
+        if len(parts) >= 2:
+            try:
+                bet_text = parts[1] if parts[0] in ['золото', 'gold', 'голд'] else parts[0]
+                bet = self._parse_bet(bet_text)
+                
+                if bet <= 0:
+                    await message.answer("❌ Ставка должна быть положительной!")
+                    return
+                
+                await self._start_gold_game(message, bet)
+                return
+                    
+            except (ValueError, IndexError):
+                pass
+        
+        await self.gold_game_start(message, state)
+    
+    async def _start_gold_game(self, message: Message, bet: int):
+        user = message.from_user
+        result = self.gold_game.start_game(user.id, bet)
+        
+        if not result['success']:
+            await message.answer(result['message'])
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton(text="🏆 Забрать выигрыш", callback_data="gold_cashout")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="gold_refresh")],
+            [InlineKeyboardButton(text="❌ Завершить игру", callback_data="gold_cancel")]
+        ]
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        await message.answer(
+            f"⛏️ ЗОЛОТО\n\n"
+            f"💰 Ставка: {bet} mDrops\n"
+            f"🎯 Текущий множитель: 1x\n"
+            f"💎 Потенциальный выигрыш: {bet} mDrops\n"
+            f"⏱️ Игра началась...\n\n"
+            f"Нажмите 'Обновить' чтобы увидеть текущий множитель",
+            reply_markup=reply_markup
+        )
+        
+        self.active_gold_messages[user.id] = message.message_id + 1
+        asyncio.create_task(self._update_gold_game(message.chat.id, user.id))
+    
+    def _parse_bet(self, bet_text: str) -> int:
+        bet_text = bet_text.lower().strip()
+        bet_text = bet_text.replace('mdrops', '').replace('монет', '').replace('coins', '').strip()
+        
+        if 'к' in bet_text or 'k' in bet_text:
+            number_text = bet_text.replace('к', '').replace('k', '').replace(',', '.').replace(' ', '')
+            try:
+                number = float(number_text)
+                return int(number * 1000)
+            except ValueError:
+                raise ValueError(f"Не могу распознать число: {number_text}")
+        else:
+            try:
+                return int(bet_text)
+            except ValueError:
+                raise ValueError(f"Не могу распознать ставку: {bet_text}")
     
     # === АДМИН КОМАНДЫ ===
     async def admin_promo(self, message: Message):
@@ -1267,7 +2011,6 @@ class CasinoBot:
         
         promo_text = "📋 АКТИВНЫЕ ПРОМОКОДЫ:\n\n"
         for code, data in promos.items():
-            import datetime
             expires = datetime.datetime.fromisoformat(data['expires_at'])
             days_left = (expires - datetime.datetime.now()).days
             
@@ -1536,6 +2279,8 @@ async def main():
     dp.message.register(casino_bot.coinflip, Command("coinflip"))
     dp.message.register(casino_bot.slots, Command("slots"))
     dp.message.register(casino_bot.dice_game, Command("dice"))
+    dp.message.register(casino_bot.gold_game_start, Command("gold"))
+    dp.message.register(casino_bot.gold_game_start, Command("золото"))
     
     # Передача NFT
     dp.message.register(casino_bot.transfer_start, Command("transfer"))
@@ -1560,10 +2305,20 @@ async def main():
     # Callback обработчики
     dp.callback_query.register(casino_bot.button_handler, F.data.startswith('coin_'))
     dp.callback_query.register(casino_bot.handle_mines_callback, F.data.startswith('mines_'))
+    dp.callback_query.register(casino_bot.handle_gold_callback, F.data.startswith('gold_'))
     dp.callback_query.register(casino_bot.handle_broadcast_callback, F.data.startswith('broadcast_'))
+    
+    # Обработчик текстовых сообщений без слеша
+    dp.message.register(casino_bot.handle_text_message)
     
     print("🎰 Казино бот запущен!")
     print(f"⚙️ Админ ID: {ADMIN_ID}")
+    print("📱 Доступные игры:")
+    print("  • монета орёл [ставка] / /coinflip")
+    print("  • слоты [ставка] / /slots")
+    print("  • кости [ставка] [число] / /dice")
+    print("  • мины [ставка] [количество_мин] / /mines")
+    print("  • золото [ставка] / /gold")
     
     await dp.start_polling(bot)
 
